@@ -1,0 +1,550 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Fairview Public Library — Ask Willow</title>
+<style>
+  :root {
+    --bg: #FAF7F0;
+    --panel: #F3EEE2;
+    --ink: #2B2420;
+    --ink-soft: #6B6357;
+    --green: #2F4A3C;
+    --green-dark: #253d31;
+    --brass: #9C7A3C;
+    --rule: #DED6C4;
+    --error: #8C3B2E;
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  }
+
+  .layout {
+    display: flex;
+    height: 100vh;
+  }
+
+  /* --- Sidebar: past conversations --- */
+
+  .sidebar {
+    width: 260px;
+    flex-shrink: 0;
+    background: var(--panel);
+    border-right: 1px solid var(--rule);
+    display: flex;
+    flex-direction: column;
+  }
+
+  .sidebar-header {
+    padding: 20px 18px 14px;
+    border-bottom: 1px solid var(--rule);
+  }
+
+  .sidebar-header .eyebrow {
+    font-size: 11px;
+    color: var(--ink-soft);
+    margin-bottom: 6px;
+  }
+
+  .sidebar-header button {
+    width: 100%;
+    background: var(--green);
+    color: #fff;
+    border: none;
+    font-size: 13px;
+    padding: 9px 0;
+    cursor: pointer;
+  }
+
+  .sidebar-header button:hover { background: var(--green-dark); }
+
+  .session-list {
+    flex: 1;
+    overflow-y: auto;
+    padding: 6px 0;
+  }
+
+  .session-item {
+    padding: 11px 18px;
+    border-bottom: 1px solid var(--rule);
+    cursor: pointer;
+    font-size: 13px;
+  }
+
+  .session-item:hover { background: rgba(0,0,0,0.03); }
+
+  .session-item.active {
+    background: rgba(47, 74, 60, 0.08);
+    border-left: 3px solid var(--green);
+    padding-left: 15px;
+  }
+
+  .session-item .title {
+    color: var(--ink);
+    margin-bottom: 3px;
+    line-height: 1.3;
+  }
+
+  .session-item .meta {
+    color: var(--ink-soft);
+    font-size: 11px;
+  }
+
+  .session-empty {
+    padding: 18px;
+    font-size: 12px;
+    color: var(--ink-soft);
+    font-style: italic;
+  }
+
+  .sidebar-toggle {
+    display: none;
+  }
+
+  /* --- Main chat column --- */
+
+  .app {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+  }
+
+  .chat-column {
+    width: 100%;
+    max-width: 680px;
+    margin: 0 auto;
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+  }
+
+  header {
+    padding: 28px 8px 16px;
+    border-bottom: 1px solid var(--rule);
+  }
+
+  header h1 {
+    font-family: Georgia, "Times New Roman", serif;
+    font-size: 22px;
+    font-weight: 400;
+    margin: 0;
+    letter-spacing: 0.2px;
+  }
+
+  header .row {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    margin-top: 4px;
+  }
+
+  header .status {
+    font-size: 13px;
+    color: var(--ink-soft);
+  }
+
+  header .status.connected::before {
+    content: "●";
+    color: var(--green);
+    margin-right: 5px;
+  }
+
+  header .status.disconnected::before {
+    content: "●";
+    color: var(--error);
+    margin-right: 5px;
+  }
+
+  header .status.viewing::before {
+    content: "●";
+    color: var(--brass);
+    margin-right: 5px;
+  }
+
+  #messages {
+    flex: 1;
+    overflow-y: auto;
+    padding: 20px 8px;
+  }
+
+  .viewing-banner {
+    display: none;
+    align-items: center;
+    justify-content: space-between;
+    background: rgba(156, 122, 60, 0.12);
+    border: 1px solid var(--rule);
+    padding: 10px 14px;
+    margin: 0 8px 12px;
+    font-size: 13px;
+    color: var(--ink-soft);
+  }
+
+  .viewing-banner button {
+    background: none;
+    border: 1px solid var(--brass);
+    color: var(--ink);
+    font-size: 12px;
+    padding: 4px 10px;
+    cursor: pointer;
+  }
+
+  .turn {
+    padding: 14px 0;
+    border-bottom: 1px solid var(--rule);
+  }
+
+  .turn .label {
+    font-size: 12px;
+    color: var(--ink-soft);
+    margin-bottom: 4px;
+  }
+
+  .turn.user {
+    text-align: right;
+  }
+
+  .turn.assistant .content {
+    font-family: Georgia, "Times New Roman", serif;
+    font-size: 16px;
+    line-height: 1.55;
+    max-width: 90%;
+  }
+
+  .turn.user .content {
+    font-size: 15px;
+    line-height: 1.5;
+    max-width: 90%;
+    margin-left: auto;
+    color: var(--ink);
+  }
+
+  .turn.error .content {
+    font-size: 14px;
+    color: var(--error);
+    font-style: italic;
+  }
+
+  .cursor {
+    display: inline-block;
+    width: 7px;
+    background: var(--brass);
+    margin-left: 2px;
+    animation: blink 1s step-start infinite;
+  }
+
+  @keyframes blink { 50% { opacity: 0; } }
+
+  form {
+    display: flex;
+    gap: 8px;
+    padding: 16px 8px 24px;
+    border-top: 1px solid var(--rule);
+  }
+
+  input[type="text"] {
+    flex: 1;
+    font-size: 15px;
+    padding: 11px 12px;
+    border: 1px solid var(--rule);
+    background: #fff;
+    color: var(--ink);
+    outline: none;
+  }
+
+  input[type="text"]:focus { border-color: var(--brass); }
+
+  button[type="submit"] {
+    background: var(--green);
+    color: #fff;
+    border: none;
+    font-size: 14px;
+    padding: 0 20px;
+    cursor: pointer;
+  }
+
+  button[type="submit"]:disabled {
+    background: var(--ink-soft);
+    cursor: not-allowed;
+  }
+
+  button[type="submit"]:hover:not(:disabled) { background: var(--green-dark); }
+
+  @media (max-width: 720px) {
+    .sidebar {
+      position: fixed;
+      inset: 0 auto 0 0;
+      z-index: 10;
+      transform: translateX(-100%);
+      transition: transform 0.2s ease;
+    }
+    .sidebar.open { transform: translateX(0); }
+    .sidebar-toggle {
+      display: block;
+      background: none;
+      border: 1px solid var(--rule);
+      color: var(--ink-soft);
+      font-size: 13px;
+      padding: 5px 12px;
+      cursor: pointer;
+      margin-right: 8px;
+    }
+  }
+</style>
+</head>
+<body>
+
+<div class="layout">
+
+  <aside class="sidebar" id="sidebar">
+    <div class="sidebar-header">
+      <div class="eyebrow">Past conversations</div>
+      <button id="newChatBtn" type="button">New conversation</button>
+    </div>
+    <div class="session-list" id="sessionList">
+      <div class="session-empty">No saved conversations yet.</div>
+    </div>
+  </aside>
+
+  <div class="app">
+    <div class="chat-column">
+      <header>
+        <h1>
+          <button class="sidebar-toggle" id="sidebarToggle" type="button">☰</button>
+          Fairview Public Library
+        </h1>
+        <div class="row">
+          <span class="status disconnected" id="status">connecting…</span>
+        </div>
+      </header>
+
+      <div class="viewing-banner" id="viewingBanner">
+        <span>Viewing a past conversation (read-only)</span>
+        <button id="backToChatBtn" type="button">Back to live chat</button>
+      </div>
+
+      <div id="messages"></div>
+
+      <form id="chatForm">
+        <input type="text" id="input" placeholder="Ask about a book, borrowing, or your due date…" autocomplete="off" disabled>
+        <button type="submit" id="sendBtn" disabled>Ask</button>
+      </form>
+    </div>
+  </div>
+
+</div>
+
+<script>
+  const WS_URL = "ws://localhost:8000/ws/chat";
+  const API_URL = "http://localhost:8000";
+
+  const statusEl = document.getElementById("status");
+  const messagesEl = document.getElementById("messages");
+  const formEl = document.getElementById("chatForm");
+  const inputEl = document.getElementById("input");
+  const sendBtn = document.getElementById("sendBtn");
+  const newChatBtn = document.getElementById("newChatBtn");
+  const sessionListEl = document.getElementById("sessionList");
+  const viewingBanner = document.getElementById("viewingBanner");
+  const backToChatBtn = document.getElementById("backToChatBtn");
+  const sidebarToggle = document.getElementById("sidebarToggle");
+  const sidebarEl = document.getElementById("sidebar");
+
+  let ws;
+  let currentAssistantContentEl = null;
+  let currentSessionId = null;
+  let viewingHistoryId = null; // set when browsing a past, read-only session
+
+  function setStatus() {
+    if (viewingHistoryId) {
+      statusEl.textContent = "viewing history";
+      statusEl.className = "status viewing";
+      inputEl.disabled = true;
+      sendBtn.disabled = true;
+      return;
+    }
+    const connected = ws && ws.readyState === WebSocket.OPEN;
+    statusEl.textContent = connected ? "connected" : "disconnected";
+    statusEl.className = "status " + (connected ? "connected" : "disconnected");
+    inputEl.disabled = !connected;
+    sendBtn.disabled = !connected;
+  }
+
+  function addTurn(role, text) {
+    const turn = document.createElement("div");
+    turn.className = "turn " + role;
+
+    const label = document.createElement("div");
+    label.className = "label";
+    label.textContent = role === "user" ? "You" : role === "error" ? "System" : "Willow";
+    turn.appendChild(label);
+
+    const content = document.createElement("div");
+    content.className = "content";
+    content.textContent = text;
+    turn.appendChild(content);
+
+    messagesEl.appendChild(turn);
+    messagesEl.scrollTop = messagesEl.scrollHeight;
+    return content;
+  }
+
+  function startAssistantTurn() {
+    currentAssistantContentEl = addTurn("assistant", "");
+    const cursor = document.createElement("span");
+    cursor.className = "cursor";
+    currentAssistantContentEl.appendChild(cursor);
+  }
+
+  function appendToken(token) {
+    if (!currentAssistantContentEl) startAssistantTurn();
+    const cursor = currentAssistantContentEl.querySelector(".cursor");
+    const textNode = document.createTextNode(token);
+    currentAssistantContentEl.insertBefore(textNode, cursor);
+    messagesEl.scrollTop = messagesEl.scrollHeight;
+  }
+
+  function finishAssistantTurn() {
+    if (currentAssistantContentEl) {
+      const cursor = currentAssistantContentEl.querySelector(".cursor");
+      if (cursor) cursor.remove();
+    }
+    currentAssistantContentEl = null;
+  }
+
+  // --- Sidebar: load and render past conversations ---
+
+  async function refreshSessionList() {
+    try {
+      const res = await fetch(`${API_URL}/sessions`);
+      const sessions = await res.json();
+      sessionListEl.innerHTML = "";
+      if (sessions.length === 0) {
+        sessionListEl.innerHTML = '<div class="session-empty">No saved conversations yet.</div>';
+        return;
+      }
+      sessions.forEach((s) => {
+        const item = document.createElement("div");
+        item.className = "session-item" + (s.session_id === viewingHistoryId ? " active" : "");
+        const date = new Date(s.updated_at);
+        item.innerHTML = `
+          <div class="title">${s.title || "New conversation"}</div>
+          <div class="meta">${date.toLocaleDateString()} · ${s.message_count} messages</div>
+        `;
+        item.addEventListener("click", () => viewHistorySession(s.session_id));
+        sessionListEl.appendChild(item);
+      });
+    } catch (e) {
+      // Sidebar failing to load shouldn't break live chat.
+      sessionListEl.innerHTML = '<div class="session-empty">Could not load history.</div>';
+    }
+  }
+
+  async function viewHistorySession(sessionId) {
+    try {
+      const res = await fetch(`${API_URL}/sessions/${sessionId}`);
+      if (!res.ok) throw new Error("not found");
+      const data = await res.json();
+
+      viewingHistoryId = sessionId;
+      messagesEl.innerHTML = "";
+      data.history.forEach((m) => {
+        if (m.content === "[off-topic request declined]") return;
+        addTurn(m.role === "user" ? "user" : "assistant", m.content);
+      });
+      viewingBanner.style.display = "flex";
+      setStatus();
+      refreshSessionList();
+      if (window.innerWidth <= 720) sidebarEl.classList.remove("open");
+    } catch (e) {
+      addTurn("error", "Could not load that conversation.");
+    }
+  }
+
+  function backToLiveChat() {
+    viewingHistoryId = null;
+    viewingBanner.style.display = "none";
+    messagesEl.innerHTML = "";
+    setStatus();
+    refreshSessionList();
+  }
+
+  backToChatBtn.addEventListener("click", backToLiveChat);
+
+  newChatBtn.addEventListener("click", () => {
+    if (viewingHistoryId) {
+      backToLiveChat();
+    }
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      messagesEl.innerHTML = "";
+      ws.send(JSON.stringify({ type: "reset" }));
+    }
+    if (window.innerWidth <= 720) sidebarEl.classList.remove("open");
+  });
+
+  sidebarToggle.addEventListener("click", () => {
+    sidebarEl.classList.toggle("open");
+  });
+
+  // --- WebSocket ---
+
+  function connect() {
+    ws = new WebSocket(WS_URL);
+
+    ws.onopen = () => setStatus();
+    ws.onclose = () => setStatus();
+    ws.onerror = () => setStatus();
+
+    ws.onmessage = (event) => {
+      let data;
+      try {
+        data = JSON.parse(event.data);
+      } catch (e) {
+        addTurn("error", "Received a malformed response from the server.");
+        return;
+      }
+
+      switch (data.type) {
+        case "session":
+          currentSessionId = data.session_id;
+          break;
+        case "token":
+          appendToken(data.content);
+          break;
+        case "done":
+          finishAssistantTurn();
+          refreshSessionList();
+          break;
+        case "error":
+          finishAssistantTurn();
+          addTurn("error", data.message || "Something went wrong.");
+          break;
+      }
+    };
+  }
+
+  formEl.addEventListener("submit", (e) => {
+    e.preventDefault();
+    if (viewingHistoryId) return; // read-only mode
+    const text = inputEl.value.trim();
+    if (!text || !ws || ws.readyState !== WebSocket.OPEN) return;
+
+    addTurn("user", text);
+    ws.send(JSON.stringify({ message: text }));
+    inputEl.value = "";
+    startAssistantTurn();
+  });
+
+  connect();
+  refreshSessionList();
+</script>
+
+</body>
+</html>
