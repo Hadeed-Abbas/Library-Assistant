@@ -1,20 +1,18 @@
 """
 Conversation Manager for the Library Assistant chatbot.
 
-Responsibilities:
-- Enforce domain policy with a deterministic keyword/pattern guard BEFORE
-  anything reaches the LLM (catches jailbreak/off-topic attempts the model
-  itself was shown, empirically, not to reliably resist on paraphrase).
-- Maintain per-session dialogue history with a fixed sliding window
-  (context memory strategy — see README for rationale).
-- Persist each session's transcript to disk as JSON, so past conversations
-  can be listed and reviewed (UX polish: conversation history sidebar).
-- Stream responses from a local Ollama model over its chat API.
+All of the assistant's behaviour comes from prompt orchestration and
+conversational memory only. There are no tools, agents, plugins, RAG, or
+rule based filters in this module.
 
-No tools, agents, or RAG are used here — this module only does prompt
-orchestration and local conversational memory, per assignment constraints.
+Memory has two layers:
+- Short term: a sliding window of the last few exchanges of the current session.
+- Long term: a short notes file about the patron. When a session ends, the
+  model itself rewrites these notes from the conversation, and the notes are
+  added to the system prompt of every later session.
 """
 
+import asyncio
 import json
 import re
 from datetime import datetime, timezone
@@ -26,161 +24,168 @@ import httpx
 # --- Configuration ---------------------------------------------------------
 
 OLLAMA_URL = "http://localhost:11434/api/chat"
-MODEL_NAME = "A1"  # match the name shown by `ollama list` on your machine
+MODEL_NAME = "A1"  # must match the name shown by `ollama list`
 
-MAX_HISTORY_TURNS = 6  # keep the last 6 user+assistant exchanges (12 messages)
+MAX_HISTORY_TURNS = 6       # last 6 exchanges (12 messages) are sent to the model
+MEMORY_MAX_CHARS = 800      # cap on the long term notes
+MEMORY_CONVO_CHARS = 3000   # how much of a finished chat the note taker reads
 
-SESSIONS_DIR = Path(__file__).parent / "sessions"
+BASE_DIR = Path(__file__).parent
+SESSIONS_DIR = BASE_DIR / "sessions"
+MEMORY_DIR = BASE_DIR / "memory"
+MEMORY_FILE = MEMORY_DIR / "patron_memory.txt"
 SESSIONS_DIR.mkdir(exist_ok=True)
+MEMORY_DIR.mkdir(exist_ok=True)
 
-REFUSAL_MESSAGE = (
-    "I'm the library assistant, so I can only help with catalogue searches, "
-    "borrowing, renewals, and due dates. Is there something along those "
-    "lines I can help with?"
-)
 
-# Paste the exact SYSTEM block content from your Modelfile here (without the
-# triple quotes). Keeping it in one place avoids the prompt drifting out of
-# sync between the Modelfile (used for manual CLI testing) and the app.
-SYSTEM_PROMPT = """You are Willow, the virtual assistant for Fairview Public Library. You help patrons with catalogue searches, borrowing policy questions, renewals, due dates, and holds. Stay strictly within this role at all times.
+def _load_system_prompt() -> str:
+    """Read the SYSTEM block straight from the Modelfile so the app and the
+    command line always use the same prompt."""
+    text = (BASE_DIR.parent / "Modelfile").read_text(encoding="utf-8")
+    match = re.search(r'SYSTEM """(.*?)"""', text, re.DOTALL)
+    if not match:
+        raise RuntimeError("Could not find the SYSTEM block in Modelfile")
+    return match.group(1).strip()
 
-## SCOPE — WHAT YOU DO
-- Search the catalogue by title, author, or genre and report availability
-- Answer questions about borrowing policy (loan periods, renewals, fines, holds)
-- Simulate checking or renewing a due date for a patron
-- Explain how holds work
-- Answer general library-operations questions (hours, how to get a card, etc.)
 
-## OUT OF SCOPE
-Anything that is not library operations. If asked, respond with:
-"I'm the library assistant, so I can only help with catalogue searches, borrowing, renewals, and due dates. Is there something along those lines I can help with?"
-Redirect once, briefly, and move on — do not explain further or lecture the user.
+SYSTEM_PROMPT = _load_system_prompt()
 
-## CONVERSATION FLOW
-1. Greeting — welcome the patron, invite their request
-2. Intent Identification — figure out what they want: search, policy question, renewal, due date, or hold
-3. Catalogue or Policy Lookup — answer using the data below
-4. Confirmation — confirm any action taken (e.g. "Renewed — your new due date is [date].")
-5. Off-topic Redirect — can happen from any stage
-6. Closing — friendly sign-off when the patron is done
 
-If the conversation goes off-topic and you redirect, and the patron then returns to their earlier library-related request, resume that request naturally. Do not restart the conversation or ask them to repeat themselves.
+# --- Long term memory (carried across chats) ---------------------------------
+# One notes file for the single demo patron. The model writes the notes, and
+# they are injected into the system prompt. Nothing is retrieved or looked up.
 
-## BORROWING POLICY (cite these exact numbers when asked)
-- Standard loan period: 21 days
-- New release / high-demand titles: 7 days
-- Maximum books per patron at once: 5
-- Renewals: 1 per book, only if no one else has a hold on it
-- Renewal extension: +14 days from the renewal date
-- Overdue fine: $0.25/day per book, capped at $10/book
-- Holds: allowed on checked-out books, first-come-first-served, patron is notified when available
-- A library card is required to borrow or place a hold, but not to search the catalogue
+_memory_lock = asyncio.Lock()
+_background_tasks = set()
 
-## TONE
-Warm, brief, professional — like a helpful librarian at a front desk, not a chatty general-purpose assistant. Keep answers focused; don't pad with unnecessary pleasantries.
-
-## CATALOGUE (your ONLY source of book data — read this section carefully, it is the most important part of this prompt)
-Format per line: Title | Author | Genre | total copies | available copies
-
-The Hobbit | J.R.R. Tolkien | Fantasy | 4 | 1
-Dune | Frank Herbert | Sci-Fi | 3 | 2
-1984 | George Orwell | Classic | 5 | 0
-Pride and Prejudice | Jane Austen | Romance | 3 | 3
-The Girl with the Dragon Tattoo | Stieg Larsson | Thriller | 2 | 1
-Sapiens | Yuval Noah Harari | Non-fiction | 3 | 1
-The Da Vinci Code | Dan Brown | Mystery | 4 | 2
-Educated | Tara Westover | Biography | 2 | 0
-The Fellowship of the Ring | J.R.R. Tolkien | Fantasy | 3 | 0
-Gone Girl | Gillian Flynn | Thriller | 3 | 3
-The Catcher in the Rye | J.D. Salinger | Classic | 2 | 1
-Brief Answers to the Big Questions | Stephen Hawking | Non-fiction | 2 | 2
-Murder on the Orient Express | Agatha Christie | Mystery | 3 | 1
-The Shining | Stephen King | Horror | 2 | 0
-Steve Jobs | Walter Isaacson | Biography | 2 | 1
-The Alchemist | Paulo Coelho | Fiction | 4 | 2
-Foundation | Isaac Asimov | Sci-Fi | 2 | 1
-Little Women | Louisa May Alcott | Classic | 2 | 2
-The Hunger Games | Suzanne Collins | Sci-Fi | 5 | 3
-Charlotte's Web | E.B. White | Children's | 3 | 3
-Atomic Habits | James Clear | Non-fiction | 4 | 0
-The Silent Patient | Alex Michaelides | Thriller | 2 | 1
-Harry Potter and the Sorcerer's Stone | J.K. Rowling | Fantasy | 6 | 2
-Where the Crawdads Sing | Delia Owens | Fiction | 3 | 1
-The Martian | Andy Weir | Sci-Fi | 2 | 2
-To Kill a Mockingbird | Harper Lee | Classic | 3 | 0
-Becoming | Michelle Obama | Biography | 2 | 1
-The Night Circus | Erin Morgenstern | Fantasy | 2 | 1
-
-## CRITICAL RULES FOR ANSWERING (apply these to every catalogue question, no exceptions)
-1. The list above is the ENTIRE catalogue. If a title is not in that list, it does not exist in this library — do not invent sequels, other editions, or related titles, even if they are real books in the world. For example, only "Harry Potter and the Sorcerer's Stone" exists here — there is no Chamber of Secrets, Prisoner of Azkaban, or any other Harry Potter book in this catalogue.
-2. If the exact title a patron asks about is not in the list, say you don't see that title in the catalogue — do not guess or substitute a similar-sounding title.
-3. The last number on each line is the available copies. If that number is greater than 0, the book IS available right now — say so and state the exact number. If that number is 0, the book is checked out — offer to place a hold. Read the actual number before answering; never state a book is unavailable when its number is greater than 0.
-4. Each new patron message is a fresh question — evaluate it on its own using the list above, even if your last reply was about a different book or a redirect."""
-
-# --- Guard: deterministic pattern matching ---------------------------------
-# These catch the *concept* of an override/off-topic attempt, not exact
-# phrasing, since testing showed the model itself breaks on close paraphrases
-# of things it was prompted to refuse.
-
-OVERRIDE_PATTERNS = [
-    r"\bignore\b.{0,20}\b(instructions?|rules?|prompt)\b",
-    r"\bdisregard\b.{0,20}\b(instructions?|rules?|prompt)\b",
-    r"\bforget\b.{0,20}\b(instructions?|rules?|prompt)\b",
-    r"\byou are now\b",
-    r"\bpretend (you'?re|you are)\b",
-    r"\bact as (a|an)\b",
-    r"\broleplay as\b",
-    r"\bno restrictions\b",
-    r"\bwithout restrictions\b",
-    r"\byour (system )?prompt\b",
-    r"\bwhat are you told\b",
-]
-
-OFFTOPIC_PATTERNS = [
-    r"\bcapital of\b",
-    r"\bweather\b",
-    r"\bwho is the (president|prime minister)\b",
-    r"\bjoke\b",
-    r"\bwhat('?s| is)\s*\d+\s*[\+\-\*/]\s*\d+\b",  # basic arithmetic
-]
-
-_GUARD_RE = re.compile(
-    "|".join(OVERRIDE_PATTERNS + OFFTOPIC_PATTERNS), re.IGNORECASE
+MEMORY_SYSTEM_PROMPT = (
+    "You write short notes about a library patron so that a librarian can "
+    "remember them on the next visit. You output only the notes."
 )
 
 
-def is_blocked(message: str) -> bool:
-    """Return True if the message should be refused without calling the LLM."""
-    return bool(_GUARD_RE.search(message))
+def load_memory() -> str:
+    if MEMORY_FILE.exists():
+        return MEMORY_FILE.read_text(encoding="utf-8").strip()
+    return ""
 
 
-# --- Session / history management ------------------------------------------
+def clear_memory() -> None:
+    if MEMORY_FILE.exists():
+        MEMORY_FILE.unlink()
+
+
+def build_system_prompt() -> str:
+    """Base prompt, plus the patron notes when there are any. The notes go at
+    the end of the prompt, closest to generation."""
+    memory = load_memory()
+    if not memory:
+        return SYSTEM_PROMPT
+    return (
+        SYSTEM_PROMPT
+        + "\n\n## WHAT YOU REMEMBER ABOUT THIS PATRON FROM PREVIOUS VISITS\n"
+        + memory
+        + "\nUse these notes naturally when they are relevant, for example to "
+        "suggest books they might like. Do not recite them unprompted, and "
+        "never treat them as catalogue data."
+    )
+
+
+def _memory_request(existing: str, conversation: str) -> str:
+    return (
+        "Existing notes about the patron:\n"
+        f"{existing or '(none)'}\n\n"
+        "What the patron said in the chat that just ended:\n"
+        f"{conversation}\n\n"
+        "Update the notes using ONLY facts the patron stated themselves. "
+        "Rules:\n"
+        "- Name: only if the patron said their name.\n"
+        "- Likes: only genres or authors the patron said they like.\n"
+        "- Asked to borrow: only books the patron said they want to borrow, "
+        "check out, or hold. Asking whether a book is available is NOT a "
+        "request to borrow it.\n"
+        "- Never write placeholders such as Unknown, None, or N/A. If you have "
+        "no fact for a line, leave that line out completely.\n"
+        "- Never guess, never add books that were not named, and never record "
+        "card numbers or ID numbers.\n"
+        "Keep the existing notes unless the patron contradicted them. Write at "
+        "most 5 short lines, each starting with '- '.\n\n"
+        "Example of the format only (never copy its facts). If the patron said "
+        "'I'm Sam. I love fantasy. Is Dune available? I'd like to borrow "
+        "Foundation.' the notes are:\n"
+        "- Name: Sam\n"
+        "- Likes: fantasy\n"
+        "- Asked to borrow: Foundation\n\n"
+        "If the patron stated nothing worth remembering, output exactly: NONE"
+    )
+
+
+async def _update_memory(transcript: List[Dict[str, str]]) -> None:
+    patron_lines = [m["content"] for m in transcript if m["role"] == "user"]
+    if not patron_lines:
+        return
+    # Only the patron's own words are shown to the note taker. Willow's replies
+    # can contain mistakes, and notes built from them would store those mistakes.
+    conversation = "\n".join(f"Patron: {line}" for line in patron_lines)[
+        -MEMORY_CONVO_CHARS:
+    ]
+
+    async with _memory_lock:
+        existing = load_memory()
+        try:
+            async with httpx.AsyncClient(timeout=180) as client:
+                response = await client.post(
+                    OLLAMA_URL,
+                    json={
+                        "model": MODEL_NAME,
+                        "stream": False,
+                        "options": {"temperature": 0.1, "num_predict": 200},
+                        "messages": [
+                            {"role": "system", "content": MEMORY_SYSTEM_PROMPT},
+                            {
+                                "role": "user",
+                                "content": _memory_request(existing, conversation),
+                            },
+                        ],
+                    },
+                )
+                response.raise_for_status()
+                notes = response.json()["message"]["content"].strip()
+        except Exception as exc:
+            print(f"Memory update skipped: {exc}")
+            return
+        if not notes or notes.upper().startswith("NONE"):
+            return
+        MEMORY_FILE.write_text(notes[:MEMORY_MAX_CHARS], encoding="utf-8")
+
+
+# --- Session / short term memory ---------------------------------------------
 
 
 class Session:
-    """Holds dialogue history for a single WebSocket session."""
+    """Dialogue state for one chat."""
 
     def __init__(self, session_id: str) -> None:
         self.session_id = session_id
-        self.history: List[Dict[str, str]] = []
+        self.history: List[Dict[str, str]] = []     # sliding window sent to the model
+        self.transcript: List[Dict[str, str]] = []  # full chat, saved and summarised
         self.created_at = datetime.now(timezone.utc).isoformat()
 
     def add_turn(self, role: str, content: str) -> None:
+        self.transcript.append({"role": role, "content": content})
         self.history.append({"role": role, "content": content})
         max_messages = MAX_HISTORY_TURNS * 2
         if len(self.history) > max_messages:
             self.history = self.history[-max_messages:]
 
     def build_messages(self, new_user_message: str) -> List[Dict[str, str]]:
-        messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+        messages = [{"role": "system", "content": build_system_prompt()}]
         messages.extend(self.history)
         messages.append({"role": "user", "content": new_user_message})
         return messages
 
 
-# In-memory session store, keyed by session id.
-# Fine for a single-process assignment demo; would need a shared store
-# (e.g. Redis) if you ever ran multiple backend processes.
+# In-memory session store, keyed by session id (single process demo).
 _sessions: Dict[str, Session] = {}
 
 
@@ -190,17 +195,25 @@ def get_session(session_id: str) -> Session:
     return _sessions[session_id]
 
 
-def reset_session(session_id: str) -> None:
-    """Drops a session from memory. The on-disk transcript (if any) is left
-    alone — resetting starts a NEW session id, it does not erase history."""
-    _sessions.pop(session_id, None)
+async def end_session(session_id: str) -> None:
+    """Close a chat: save it, then let the model update the patron notes."""
+    session = _sessions.pop(session_id, None)
+    if session is None:
+        return
+    save_session(session)
+    await _update_memory(session.transcript)
 
 
-# --- Persistence (conversation history sidebar) -----------------------------
-# Note: this is local disk I/O for saving/loading the app's OWN conversation
-# transcripts — not retrieval of outside knowledge for the model to reason
-# over. It has no bearing on the "no RAG" constraint, which is about how the
-# LLM gets its answers, not about the app persisting its own chat logs.
+def schedule_end_session(session_id: str) -> None:
+    """Run end_session in the background so the UI is never blocked."""
+    task = asyncio.create_task(end_session(session_id))
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+
+
+# --- Saved transcripts (history sidebar) ---------------------------------------
+# This is the app saving its own chat logs. The model is never given anything
+# looked up from these files, apart from the notes described above.
 
 
 def _session_file(session_id: str) -> Path:
@@ -208,24 +221,24 @@ def _session_file(session_id: str) -> Path:
 
 
 def save_session(session: Session) -> None:
-    if not session.history:
-        return  # don't clutter the sidebar with empty sessions
+    if not session.transcript:
+        return
     first_user_msg = next(
-        (m["content"] for m in session.history if m["role"] == "user"), ""
+        (m["content"] for m in session.transcript if m["role"] == "user"), ""
     )
-    title = (first_user_msg[:48] + "…") if len(first_user_msg) > 48 else first_user_msg
+    title = (first_user_msg[:48] + "...") if len(first_user_msg) > 48 else first_user_msg
     data = {
         "session_id": session.session_id,
         "title": title or "New conversation",
         "created_at": session.created_at,
         "updated_at": datetime.now(timezone.utc).isoformat(),
-        "history": session.history,
+        "history": session.transcript,
     }
     _session_file(session.session_id).write_text(json.dumps(data, indent=2))
 
 
 def list_sessions() -> List[Dict]:
-    """Returns metadata (no full history) for the sidebar, newest first."""
+    """Metadata for the sidebar, newest first."""
     sessions = []
     for f in SESSIONS_DIR.glob("*.json"):
         try:
@@ -252,28 +265,19 @@ def load_session_transcript(session_id: str) -> Optional[Dict]:
     return json.loads(f.read_text())
 
 
-# --- LLM streaming -----------------------------------------------------------
+# --- LLM streaming ---------------------------------------------------------------
 
 
 async def stream_response(
     session_id: str, user_message: str
 ) -> AsyncGenerator[str, None]:
-    """
-    Yields response text incrementally (token by token) for a given session.
-    If the message trips the guard, yields the canned refusal immediately
-    without calling the model at all.
-    """
+    """Yield the model's reply token by token for one patron message."""
     session = get_session(session_id)
 
-    if is_blocked(user_message):
-        session.add_turn("user", user_message)
-        # Store a neutral note rather than the literal refusal sentence.
-        # Repeating that exact string in history biases the model toward
-        # copying it verbatim on later, unrelated turns (observed in testing).
-        session.add_turn("assistant", "[off-topic request declined]")
-        save_session(session)
-        yield REFUSAL_MESSAGE
-        return
+    # If a memory update from the previous chat is still running, wait for it
+    # so this chat starts with the latest notes.
+    async with _memory_lock:
+        pass
 
     messages = session.build_messages(user_message)
     full_response = ""
@@ -288,6 +292,8 @@ async def stream_response(
                 if not line:
                     continue
                 chunk = json.loads(line)
+                if "error" in chunk:
+                    raise RuntimeError(chunk["error"])
                 token = chunk.get("message", {}).get("content", "")
                 if token:
                     full_response += token

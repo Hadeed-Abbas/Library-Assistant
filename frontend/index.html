@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Fairview Public Library — Ask Willow</title>
+<title>Fairview Public Library | Ask Willow</title>
 <style>
   :root {
     --bg: #FAF7F0;
@@ -277,6 +277,48 @@
 
   button[type="submit"]:hover:not(:disabled) { background: var(--green-dark); }
 
+  .memory-panel {
+    border-top: 1px solid var(--rule);
+    padding: 12px 18px 16px;
+    font-size: 12px;
+  }
+
+  .memory-panel .eyebrow {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    font-size: 11px;
+    color: var(--ink-soft);
+    margin-bottom: 6px;
+  }
+
+  .memory-panel button {
+    background: none;
+    border: 1px solid var(--rule);
+    color: var(--ink-soft);
+    font-size: 11px;
+    padding: 2px 8px;
+    cursor: pointer;
+  }
+
+  .memory-panel button:hover {
+    border-color: var(--brass);
+    color: var(--ink);
+  }
+
+  .memory-text {
+    white-space: pre-wrap;
+    color: var(--ink);
+    line-height: 1.4;
+    max-height: 140px;
+    overflow-y: auto;
+  }
+
+  .memory-text.empty {
+    color: var(--ink-soft);
+    font-style: italic;
+  }
+
   @media (max-width: 720px) {
     .sidebar {
       position: fixed;
@@ -310,6 +352,13 @@
     </div>
     <div class="session-list" id="sessionList">
       <div class="session-empty">No saved conversations yet.</div>
+    </div>
+    <div class="memory-panel">
+      <div class="eyebrow">
+        <span>What Willow remembers</span>
+        <button id="clearMemoryBtn" type="button">Clear</button>
+      </div>
+      <div class="memory-text empty" id="memoryText">Nothing yet.</div>
     </div>
   </aside>
 
@@ -542,8 +591,53 @@
     startAssistantTurn();
   });
 
+  // --- Long term memory panel ---
+
+  const memoryTextEl = document.getElementById("memoryText");
+  const clearMemoryBtn = document.getElementById("clearMemoryBtn");
+
+  async function refreshMemory() {
+    try {
+      const res = await fetch(`${API_URL}/memory`);
+      const data = await res.json();
+      if (data.memory) {
+        memoryTextEl.textContent = data.memory;
+        memoryTextEl.className = "memory-text";
+      } else {
+        memoryTextEl.textContent = "Nothing yet.";
+        memoryTextEl.className = "memory-text empty";
+      }
+    } catch (e) {
+      // The panel failing to load must not affect live chat.
+    }
+  }
+
+  clearMemoryBtn.addEventListener("click", async () => {
+    try {
+      await fetch(`${API_URL}/memory`, { method: "DELETE" });
+    } catch (e) {}
+    refreshMemory();
+  });
+
   connect();
   refreshSessionList();
+  refreshMemory();
+  // The model rewrites the notes in the background after a chat ends, so poll.
+  setInterval(refreshMemory, 10000);
+
+  // Browsers throttle timers in background tabs, so refresh when the tab
+  // comes back, and poll quickly for two minutes after a chat is closed.
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden) refreshMemory();
+  });
+
+  newChatBtn.addEventListener("click", () => {
+    let polls = 0;
+    const id = setInterval(() => {
+      refreshMemory();
+      if (++polls >= 40) clearInterval(id);
+    }, 3000);
+  });
 </script>
 
 </body>

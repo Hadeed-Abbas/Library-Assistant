@@ -2,25 +2,25 @@
 FastAPI backend for the Library Assistant chatbot.
 
 Endpoints:
-- GET  /health              — basic liveness check (REST)
-- GET  /sessions            — list saved past conversations, newest first (REST)
-- GET  /sessions/{id}       — full transcript of one saved conversation (REST)
-- WS   /ws/chat              — real-time chat, one session per connection
+- GET    /health          liveness check
+- GET    /sessions        list saved past conversations, newest first
+- GET    /sessions/{id}   full transcript of one saved conversation
+- GET    /memory          the long term notes Willow keeps about the patron
+- DELETE /memory          clear those notes
+- WS     /ws/chat         real-time chat, one session per connection
 
 WebSocket message protocol (JSON both directions):
 
 Client -> Server:
-    {"message": "do you have the hobbit?"}          # normal chat turn
-    {"type": "reset"}                                 # start a new session
+    {"message": "do you have the hobbit?"}     a normal chat turn
+    {"type": "reset"}                            end this chat and start a new one
 
 Server -> Client:
-    {"type": "session", "session_id": "..."}           # sent on connect AND
-                                                          # after a reset (new id)
-    {"type": "token", "content": "..."}                 # one per streamed token
-    {"type": "done"}                                    # end of a response
-    {"type": "error", "message": "..."}                 # malformed request or
-                                                          # model/inference error;
-                                                          # connection stays open
+    {"type": "session", "session_id": "..."}    sent on connect and after a reset
+    {"type": "token", "content": "..."}          one per streamed token
+    {"type": "done"}                             end of a response
+    {"type": "error", "message": "..."}          malformed request or model error;
+                                                 the connection stays open
 """
 
 import json
@@ -30,16 +30,17 @@ from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
 from conversation_manager import (
+    clear_memory,
     list_sessions,
+    load_memory,
     load_session_transcript,
-    reset_session,
+    schedule_end_session,
     stream_response,
 )
 
 app = FastAPI(title="Library Assistant Chatbot")
 
-# Allows the frontend (served from a different origin/port) to connect.
-# Fine for an assignment demo; tighten allow_origins before any real deployment.
+# The frontend is opened from a file, so it is a different origin from the API.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -55,28 +56,34 @@ async def health():
 
 @app.get("/sessions")
 async def get_sessions():
-    """Metadata for every saved conversation, for the history sidebar."""
     return list_sessions()
 
 
 @app.get("/sessions/{session_id}")
 async def get_session_transcript(session_id: str):
-    """Full transcript of one saved conversation, read-only."""
     transcript = load_session_transcript(session_id)
     if transcript is None:
         raise HTTPException(status_code=404, detail="Session not found.")
     return transcript
 
 
+@app.get("/memory")
+async def get_memory():
+    return {"memory": load_memory()}
+
+
+@app.delete("/memory")
+async def delete_memory():
+    clear_memory()
+    return {"memory": ""}
+
+
 @app.websocket("/ws/chat")
 async def ws_chat(websocket: WebSocket):
     await websocket.accept()
 
-    # One session per connection — this is what gives you "multiple
-    # concurrent users without blocking each other": each connection is its
-    # own asyncio task with its own session_id and history in
-    # conversation_manager, so one user's slow generation doesn't hold up
-    # another user's turn.
+    # One session per connection. Each connection is its own asyncio task, so
+    # one user's slow generation does not block another user's turn.
     session_id = str(uuid.uuid4())
     await websocket.send_json({"type": "session", "session_id": session_id})
 
@@ -84,57 +91,42 @@ async def ws_chat(websocket: WebSocket):
         while True:
             raw = await websocket.receive_text()
 
-            # --- Parse incoming message ---
             try:
                 data = json.loads(raw)
             except json.JSONDecodeError:
                 await websocket.send_json(
-                    {
-                        "type": "error",
-                        "message": "Malformed request: expected valid JSON.",
-                    }
+                    {"type": "error", "message": "Malformed request: expected valid JSON."}
                 )
                 continue
 
             if not isinstance(data, dict):
                 await websocket.send_json(
-                    {
-                        "type": "error",
-                        "message": "Malformed request: expected a JSON object.",
-                    }
+                    {"type": "error", "message": "Malformed request: expected a JSON object."}
                 )
                 continue
 
-            # --- Handle a reset: start a brand new session id so the old
-            # conversation's saved transcript is left intact on disk rather
-            # than being overwritten by the next turn. ---
+            # Reset: close this chat (saved, and the model updates the patron
+            # notes in the background) and start a fresh session id.
             if data.get("type") == "reset":
-                reset_session(session_id)
+                schedule_end_session(session_id)
                 session_id = str(uuid.uuid4())
-                await websocket.send_json(
-                    {"type": "session", "session_id": session_id}
-                )
+                await websocket.send_json({"type": "session", "session_id": session_id})
                 continue
 
-            # --- Validate the chat message ---
             user_message = data.get("message")
             if not user_message or not isinstance(user_message, str):
                 await websocket.send_json(
-                    {
-                        "type": "error",
-                        "message": "Malformed request: 'message' (string) is required.",
-                    }
+                    {"type": "error", "message": "Malformed request: 'message' (string) is required."}
                 )
                 continue
 
-            # --- Stream the response ---
             try:
                 async for token in stream_response(session_id, user_message):
                     await websocket.send_json({"type": "token", "content": token})
                 await websocket.send_json({"type": "done"})
             except Exception as exc:
-                # Covers Ollama being unreachable, a model error, etc.
-                # The connection stays open so the user can just try again.
+                # Ollama unreachable, model missing, and so on. The connection
+                # stays open so the user can simply try again.
                 await websocket.send_json(
                     {
                         "type": "error",
@@ -143,4 +135,12 @@ async def ws_chat(websocket: WebSocket):
                 )
 
     except WebSocketDisconnect:
-        reset_session(session_id)
+        pass
+    except Exception as exc:
+        # Any other failure on a dead or broken connection (for example a send
+        # after the client closed mid-reply) must not skip the cleanup below.
+        print(f"Connection ended with an error: {exc}")
+    finally:
+        # Always close the chat: save it and let the model update the patron
+        # notes, however the connection ended.
+        schedule_end_session(session_id)
