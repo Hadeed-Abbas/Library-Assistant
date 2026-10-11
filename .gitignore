@@ -1,4 +1,10 @@
-/backend/__pycache__
-/backend/sessions
-/backend/venv
-/backend/memory
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+backend/sessions/*.json
+backend/memory/patron_memory.txt
+backend/rag_index/embeddings.npy
+backend/rag_index/chunks.json
+backend/rag_index/manifest.json
+.env

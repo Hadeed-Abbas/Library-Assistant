@@ -1,0 +1,1 @@
+This directory stores generated index files (`embeddings.npy`, `chunks.json`, and `manifest.json`). They are created by running `python scripts/build_index.py` from the project root. They are intentionally not checked in because they are reproducibly generated from `documents/` and the locally downloaded embedding model.
